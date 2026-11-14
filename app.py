@@ -10,8 +10,9 @@ import yfinance as yf
 st.set_page_config(page_title='NSE ADX + Knoxville Screener', layout='wide')
 st.title('📈 NSE Trending & Reversal Stock Screener')
 st.markdown(
-    'Filters trending NSE stocks (**ADX > 25**) using **Knoxville Divergence**'
-    ' and **MACD-Histogram** confirmation.'
+    'Filters trending NSE stocks (**ADX > Threshold**) using **Knoxville'
+    ' Divergence** and **MACD-Histogram** confirmation. Automatically uses the'
+    ' **last completed trading day** on weekends and market holidays.'
 )
 
 
@@ -98,35 +99,35 @@ def compute_macd_hist(close, fast=12, slow=26, signal=9):
     return macd_line - signal_line
 
 
-def detect_knoxville_divergence(
-    df, lookback=30, mom_period=20, rsi_period=21, ob=70, os=30
+def detect_knoxville_at_index(
+    df, mom, rsi, target_idx, lookback=30, ob=70, os=30
 ):
-    if len(df) < lookback + mom_period:
-        return False, False
-
-    close, high, low = df['Close'], df['High'], df['Low']
-    mom = close.diff(mom_period)
-    rsi = compute_rsi(close, period=rsi_period)
-
-    curr_idx = len(df) - 1
+    """Checks Bullish/Bearish Knoxville Divergence at a specific bar index."""
+    high, low = df['High'], df['Low']
     bearish_kd, bullish_kd = False, False
 
-    if high.iloc[curr_idx] >= high.iloc[curr_idx - lookback : curr_idx + 1].max():
+    if (
+        high.iloc[target_idx]
+        >= high.iloc[target_idx - lookback : target_idx + 1].max()
+    ):
         for i in range(5, lookback + 1):
-            past_idx = curr_idx - i
+            past_idx = target_idx - i
             if (
-                mom.iloc[curr_idx] < mom.iloc[past_idx]
-                and rsi.iloc[past_idx : curr_idx + 1].max() >= ob
+                mom.iloc[target_idx] < mom.iloc[past_idx]
+                and rsi.iloc[past_idx : target_idx + 1].max() >= ob
             ):
                 bearish_kd = True
                 break
 
-    if low.iloc[curr_idx] <= low.iloc[curr_idx - lookback : curr_idx + 1].min():
+    if (
+        low.iloc[target_idx]
+        <= low.iloc[target_idx - lookback : target_idx + 1].min()
+    ):
         for i in range(5, lookback + 1):
-            past_idx = curr_idx - i
+            past_idx = target_idx - i
             if (
-                mom.iloc[curr_idx] > mom.iloc[past_idx]
-                and rsi.iloc[past_idx : curr_idx + 1].min() <= os
+                mom.iloc[target_idx] > mom.iloc[past_idx]
+                and rsi.iloc[past_idx : target_idx + 1].min() <= os
             ):
                 bullish_kd = True
                 break
@@ -135,51 +136,78 @@ def detect_knoxville_divergence(
 
 
 def analyze_stock(params):
-    symbol, adx_threshold, min_volume = params
+    symbol, adx_threshold, min_volume, signal_window, rsi_ob, rsi_os = params
     try:
         df = yf.download(symbol, period='6mo', interval='1d', progress=False)
-        if df.empty or len(df) < 60:
+        if df.empty:
             return None
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        # Liquidity filter
+        # Strip out non-trading weekend/holiday placeholder rows with missing prices or zero volume
+        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        df = df[df['Volume'] > 0]
+
+        if len(df) < 60:
+            return None
+
+        # Liquidity filter on last 20 valid business days
         avg_vol = df['Volume'].tail(20).mean()
         if avg_vol < min_volume:
             return None
 
-        # 1. ADX Filter
+        # 1. ADX Filter on the last valid trading day
         adx_series = compute_adx(df['High'], df['Low'], df['Close'], period=14)
         latest_adx = adx_series.iloc[-1]
         if pd.isna(latest_adx) or latest_adx < adx_threshold:
             return None
 
-        # 2. Knoxville Divergence
-        bull_kd, bear_kd = detect_knoxville_divergence(df)
-        if not (bull_kd or bear_kd):
-            return None
-
-        # 3. MACD Histogram Confirmation
+        # Precompute Momentum, RSI, and MACD-Histogram
+        mom = df['Close'].diff(20)
+        rsi = compute_rsi(df['Close'], period=21)
         macd_hist = compute_macd_hist(df['Close'], fast=12, slow=26, signal=9)
-        hist_curr = macd_hist.iloc[-1]
-        hist_prev = macd_hist.iloc[-2]
 
-        signal = None
-        if bull_kd and hist_curr > hist_prev:
-            signal = 'BUY (Bullish KD + Rising MACD-H)'
-        elif bear_kd and hist_curr < hist_prev:
-            signal = 'SELL (Bearish KD + Falling MACD-H)'
+        # Check across the selected recent trading day window (e.g., last 1 to 5 sessions)
+        for offset in range(signal_window):
+            target_idx = len(df) - 1 - offset
+            if target_idx < 50:
+                break
 
-        if signal:
-            return {
-                'Symbol': symbol.replace('.NS', ''),
-                'Close (₹)': round(df['Close'].iloc[-1], 2),
-                'ADX (14)': round(latest_adx, 2),
-                'MACD Hist': round(hist_curr, 4),
-                '20D Avg Vol': int(avg_vol),
-                'Signal': signal,
-            }
+            bull_kd, bear_kd = detect_knoxville_at_index(
+                df,
+                mom,
+                rsi,
+                target_idx,
+                lookback=30,
+                ob=rsi_ob,
+                os=rsi_os,
+            )
+            if not (bull_kd or bear_kd):
+                continue
+
+            hist_curr = macd_hist.iloc[target_idx]
+            hist_prev = macd_hist.iloc[target_idx - 1]
+
+            signal = None
+            if bull_kd and hist_curr > hist_prev:
+                signal = 'BUY (Bullish KD + Rising MACD-H)'
+            elif bear_kd and hist_curr < hist_prev:
+                signal = 'SELL (Bearish KD + Falling MACD-H)'
+
+            if signal:
+                signal_date = df.index[target_idx].strftime('%Y-%m-%d')
+                last_trade_date = df.index[-1].strftime('%Y-%m-%d')
+                return {
+                    'Symbol': symbol.replace('.NS', ''),
+                    'Last Session': last_trade_date,
+                    'Signal Date': signal_date,
+                    'Close (₹)': round(df['Close'].iloc[-1], 2),
+                    'ADX (14)': round(latest_adx, 2),
+                    'MACD Hist': round(macd_hist.iloc[-1], 4),
+                    '20D Avg Vol': int(avg_vol),
+                    'Signal': signal,
+                }
     except Exception:
         return None
     return None
@@ -191,15 +219,29 @@ scan_limit = st.sidebar.slider(
     'Number of NSE Stocks to Scan',
     min_value=50,
     max_value=2200,
-    value=150,
+    value=300,
     step=50,
 )
 adx_min = st.sidebar.slider(
     'Minimum ADX (Trend Strength)', min_value=15, max_value=40, value=25
 )
+signal_days = st.sidebar.slider(
+    'Signal Window (Last N Trading Days)',
+    min_value=1,
+    max_value=5,
+    value=3,
+    help=(
+        '1 = Only the most recent business day. 3 = Signals triggered in the'
+        ' last 3 trading sessions.'
+    ),
+)
 min_vol = st.sidebar.number_input(
     'Minimum 20-Day Avg Volume', value=100000, step=50000
 )
+
+with st.sidebar.expander('Advanced Knoxville Settings'):
+    rsi_ob = st.slider('RSI Overbought Level', 60, 80, 70)
+    rsi_os = st.slider('RSI Oversold Level', 20, 40, 30)
 
 if st.button('🚀 Run Market Scan', type='primary'):
     symbols = get_nse_symbols()[:scan_limit]
@@ -207,7 +249,9 @@ if st.button('🚀 Run Market Scan', type='primary'):
     status_text = st.empty()
 
     results = []
-    tasks = [(sym, adx_min, min_vol) for sym in symbols]
+    tasks = [
+        (sym, adx_min, min_vol, signal_days, rsi_ob, rsi_os) for sym in symbols
+    ]
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         for idx, res in enumerate(executor.map(analyze_stock, tasks)):
@@ -220,19 +264,21 @@ if st.button('🚀 Run Market Scan', type='primary'):
     progress_bar.empty()
 
     if results:
-        st.success(f'Found {len(results)} matching stocks!')
         results_df = pd.DataFrame(results)
+        latest_session = results_df['Last Session'].max()
+        st.info(f'📅 Data anchored to last NSE trading day: **{latest_session}**')
+        st.success(f'Found {len(results)} matching stocks!')
         st.dataframe(results_df, use_container_width=True)
 
         csv = results_df.to_csv(index=False).encode('utf-8')
         st.download_button(
             '📥 Download Signals as CSV',
             data=csv,
-            file_name='nse_signals.csv',
+            file_name=f'nse_signals_{latest_session}.csv',
             mime='text/csv',
         )
     else:
         st.warning(
-            'No stocks matched all criteria today. Try lowering the ADX'
-            ' threshold or increasing the scan limit.'
+            'No stocks matched all criteria. Try increasing the **Number of'
+            ' NSE Stocks to Scan** or widening the **Signal Window**.'
         )
